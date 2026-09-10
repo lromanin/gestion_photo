@@ -1,0 +1,11 @@
+services:
+  photo-manager:
+    build: .
+    container_name: photo-manager
+    restart: unless-stopped
+    volumes:
+      - /mnt/maisonprincipal/Medias/photos_new/photos_et_videos:/data/photos_et_videos
+      - /mnt/maisonprincipal/Medias/photos_new/_a_trier:/data/a_trier
+      - /mnt/maisonprincipal/Medias/photos_new/_doublons_detectes:/data/doublons_detectes
+      - /mnt/maisonprincipal/Medias/photos_new/_sans_date_exif:/data/sans_date_exif
+      - /mnt/maisonprincipal/Projets_donnees/gestion_photo/rapports:/data/rapports

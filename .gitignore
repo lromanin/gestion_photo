@@ -1,0 +1,20 @@
+# Secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Données générées
+
+# IDE
+
+# OS
+
+# Scripts de déploiement
+deploy.sh
+
+# Documentation
+
