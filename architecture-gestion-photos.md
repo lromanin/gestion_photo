@@ -2,7 +2,7 @@
 
 ## 1. Contexte
 
-- **Stockage primaire** : NAS TrueNAS Scale (~400 Go), organisation `AAAA/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext`
+- **Stockage primaire** : NAS TrueNAS Scale (~400 Go), organisation `AAAA/AAAAMM/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext`
 - **Backup** : Mega, actuellement synchronisé manuellement
 - **Ingestion actuelle** : copie manuelle depuis carte SD/câble, puis scripts de renommage séparés (photos / vidéos)
 - **Problème** : dossiers temporaires accumulés au fil du temps, doublons et manques non identifiés
@@ -14,8 +14,17 @@
 Le conteneur ne fait tourner aucun service en continu : il reste actif via `sleep infinity` pour permettre des commandes ponctuelles via `docker exec`, à la demande (pas de démon, pas d'API).
 
 ```bash
-ssh rludovic@192.168.1.31 "docker exec photo-manager python3 audit.py --scan /data/photos_et_videos /data/a_trier --output /data/rapports/rapport_audit.csv"
+ssh rludovic@192.168.1.31 "docker exec photo-manager python3 audit.py --scan /data/photos_et_videos /data/a_trier --output /data/app_data/rapports/rapport_audit.csv"
 ```
+
+### Utilisateur non-root
+
+Le conteneur ne s'exécute pas en `root`. Un utilisateur dédié (`photomgr`, UID/GID `1500` par défaut, configurable via `APP_UID`/`APP_GID` dans un `.env`) est créé côté hôte et répliqué dans l'image Docker, pour que les fichiers écrits par le conteneur appartiennent à un utilisateur non-privilégié sur le NAS.
+
+**Mise en place (une fois) :**
+1. TrueNAS → Credentials → Local Users → créer `photomgr`, UID fixe (ex. `1500`), shell `nologin`
+2. `sudo chown -R 1500:1500 /mnt/maisonprincipal/Medias/photos_new /mnt/maisonprincipal/Projets_donnees/gestion_photo`
+3. Le `Dockerfile` crée ce même utilisateur (UID/GID passés en build args) et bascule dessus (`USER photomgr`) avant le `CMD`
 
 ## 3. Arborescence sur le NAS
 
@@ -24,7 +33,7 @@ ssh rludovic@192.168.1.31 "docker exec photo-manager python3 audit.py --scan /da
 ├── Medias/
 │   └── photos_new/
 │       ├── photos_et_videos/          ← collection finale, organisée
-│       │   └── AAAA/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext
+│       │   └── AAAA/AAAAMM/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext
 │       ├── _a_trier/                  ← fichiers réels, dépôt après copie SD/câble
 │       ├── _doublons_detectes/        ← fichiers réels, en quarantaine
 │       └── _sans_date_exif/           ← fichiers réels, sans date fiable trouvée
@@ -40,7 +49,8 @@ ssh rludovic@192.168.1.31 "docker exec photo-manager python3 audit.py --scan /da
 │       └── tests/
 │
 └── Projets_donnees/
-    └── gestion_photo/
+    └── gestion_photo/                 ← point de montage unique /data/app_data
+        ├── hash_cache.db              ← cache SQLite (hash + date EXIF)
         └── rapports/                  ← CSV uniquement (jamais de médias ici)
             ├── rapport_audit.csv
             └── doublons_log.csv
@@ -50,7 +60,7 @@ ssh rludovic@192.168.1.31 "docker exec photo-manager python3 audit.py --scan /da
 
 - `_a_trier/`, `_doublons_detectes/`, `_sans_date_exif/` contiennent des **fichiers photo/vidéo réels**, jamais de CSV
 - Les rapports (CSV) vivent exclusivement dans `Projets_donnees/gestion_photo/rapports/`, pour ne jamais mélanger métadonnées et médias
-- Le conteneur Docker monte les 4 dossiers de `Medias/photos_new/*` ainsi que `rapports/` en volumes (voir `docker-compose.yml`)
+- Le conteneur Docker monte les 4 dossiers de `Medias/photos_new/*` ainsi que `Projets_donnees/gestion_photo/` (en un seul point, `/data/app_data`) en volumes (voir `docker-compose.yml`)
 
 ## 4. Comment on interagit avec le script
 
@@ -59,7 +69,7 @@ Tout se pilote **en ligne de commande via SSH**, pas d'interface web dans cette 
 ### `audit.py` — état des lieux (lecture seule, ne modifie rien)
 
 ```bash
-docker exec photo-manager python3 audit.py --scan /data/photos_et_videos /data/a_trier --output /data/rapports/rapport_audit.csv
+docker exec photo-manager python3 audit.py --scan /data/photos_et_videos /data/a_trier --output /data/app_data/rapports/rapport_audit.csv
 ```
 
 Produit un CSV avec, pour chaque fichier : chemin, date EXIF trouvée (ou absente), hash, statut (`ok`, `doublon`, `sans_exif`, `mal_nomme`).
@@ -70,7 +80,7 @@ Produit un CSV avec, pour chaque fichier : chemin, date EXIF trouvée (ou absent
 docker exec photo-manager python3 ingest.py --source /data/a_trier --dest /data/photos_et_videos
 ```
 
-- Renomme et range selon le format `AAAA/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext`
+- Renomme et range selon le format `AAAA/AAAAMM/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext`
 - Détecte les doublons via `hashes.db` → les déplace dans `_doublons_detectes/` au lieu de les intégrer
 - Les fichiers sans date EXIF exploitable vont dans `_sans_date_exif/` pour traitement manuel
 - Rien n'est jamais supprimé automatiquement ; le script écrit un log détaillé de chaque action

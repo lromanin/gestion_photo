@@ -6,138 +6,71 @@ Ne déplace, ne renomme, ne supprime RIEN. Produit un rapport CSV.
 
 Pour chaque fichier trouvé :
   - calcule un hash SHA-256 (détection de doublons stricts)
-  - extrait la date de prise de vue (EXIF via exiftool, sinon fallback)
+  - extrait la date de prise de vue : EXIF (via exiftool) en priorité,
+    sinon tentative d'extraction depuis le nom du fichier (formats
+    appareil/téléphone/WhatsApp courants), sinon aucune date
   - calcule le chemin/nom "cible" attendu selon la convention
-    AAAA/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext
+    AAAA/AAAAMM/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext
   - détermine un statut : ok / doublon / sans_exif / mal_nomme
 
 Usage :
-    python audit.py --scan /mnt/pool/Photos /mnt/pool/_a_trier \
-                     --output rapport_audit.csv
+    python audit.py --scan /data/photos_et_videos /data/a_trier \
+                     --output /data/app_data/rapports/rapport_audit.csv
+
+Cache :
+    Un cache SQLite (--cache-db, défaut /data/app_data/hash_cache.db,
+    sur le volume persistant) retient hash et date de chaque fichier
+    déjà traité, indexés par (chemin, taille, date de modification). Les
+    fichiers inchangés depuis le dernier scan ne sont pas relus ni
+    re-hashés. Ce cache est partagé avec ingest.py (voir photo_common.py).
+
+Logging :
+    Logs affichés en console (utile en exécution interactive via
+    docker exec). DEBUG=1 en variable d'environnement active les logs de
+    niveau DEBUG.
 
 Prérequis :
     - Python 3.8+
-    - exiftool installé sur le système (recommandé). Le script fonctionne
-      sans, mais bascule alors sur la date de modification du fichier pour
-      TOUS les fichiers (moins fiable), et le signale dans le rapport.
+    - exiftool installé sur le système (recommandé). Sans exiftool, le
+      script tente d'extraire la date depuis le nom du fichier ; si ça
+      échoue aussi, le fichier reste sans date (statut sans_exif),
+      jamais de date approximative silencieuse via mtime.
 """
 
 import argparse
 import csv
-import hashlib
-import json
-import shutil
-import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
 
-# Extensions prises en compte (on élargit large : photos + RAW + vidéos)
-PHOTO_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".bmp", ".webp",
-    ".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2",
-}
-VIDEO_EXTENSIONS = {
-    ".mp4", ".mov", ".avi", ".mkv", ".m4v", ".3gp", ".mts", ".m2ts",
-}
-ALL_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
+from photo_common import (
+    ALL_EXTENSIONS,
+    compute_sha256,
+    exiftool_available,
+    expected_relative_path,
+    get_best_date,
+    get_cached_entry,
+    get_logger,
+    open_cache_db,
+    store_cache_entry,
+)
 
-# Tags EXIF/QuickTime à essayer, dans l'ordre de préférence
-EXIFTOOL_DATE_TAGS = [
-    "DateTimeOriginal",
-    "CreateDate",
-    "MediaCreateDate",
-    "TrackCreateDate",
-]
-
-HASH_CHUNK_SIZE = 1024 * 1024  # 1 Mo
+logger = get_logger("gestion_photo.audit")
 
 
-def exiftool_available():
-    return shutil.which("exiftool") is not None
-
-
-def get_exif_date(filepath, exiftool_ok):
-    """
-    Retourne un objet datetime pour la date de prise de vue, ou None si
-    introuvable / pas d'exiftool disponible.
-    """
-    if not exiftool_ok:
-        return None
-
-    try:
-        result = subprocess.run(
-            ["exiftool", "-json", "-DateTimeOriginal", "-CreateDate",
-             "-MediaCreateDate", "-TrackCreateDate", str(filepath)],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return None
-
-        data = json.loads(result.stdout)
-        if not data:
-            return None
-
-        info = data[0]
-        for tag in EXIFTOOL_DATE_TAGS:
-            raw = info.get(tag)
-            if not raw:
-                continue
-            # Format exiftool typique : "2024:06:12 14:30:22" (parfois avec
-            # un fuseau horaire en suffixe, qu'on tronque volontairement)
-            raw_clean = raw.strip()
-            try:
-                return datetime.strptime(raw_clean[:19], "%Y:%m:%d %H:%M:%S")
-            except ValueError:
-                continue
-        return None
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
-        return None
-
-
-def get_fallback_date(filepath):
-    """Date de modification du fichier, en dernier recours."""
-    try:
-        return datetime.fromtimestamp(filepath.stat().st_mtime)
-    except OSError:
-        return None
-
-
-def compute_sha256(filepath):
-    sha256 = hashlib.sha256()
-    try:
-        with open(filepath, "rb") as f:
-            for chunk in iter(lambda: f.read(HASH_CHUNK_SIZE), b""):
-                sha256.update(chunk)
-        return sha256.hexdigest()
-    except OSError as e:
-        print(f"  [!] Impossible de lire {filepath} : {e}", file=sys.stderr)
-        return None
-
-
-def expected_relative_path(date_obj, extension):
-    """
-    Construit le chemin relatif attendu selon la convention
-    AAAA/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext
-    """
-    yyyy = date_obj.strftime("%Y")
-    yyyymmdd = date_obj.strftime("%Y%m%d")
-    yyyymmdd_hhmmss = date_obj.strftime("%Y%m%d-%H%M%S")
-    return f"{yyyy}/{yyyymmdd}/{yyyymmdd_hhmmss}{extension.lower()}"
-
-
-def scan_directories(scan_dirs, exiftool_ok):
+def scan_directories(scan_dirs, exiftool_ok, cache_conn):
     """
     Parcourt les répertoires donnés, retourne une liste de dicts décrivant
-    chaque fichier trouvé.
+    chaque fichier trouvé. Réutilise le cache pour les fichiers inchangés.
     """
     entries = []
     total_files = 0
+    cache_hits = 0
+    cache_misses = 0
 
     for scan_dir in scan_dirs:
         scan_path = Path(scan_dir)
         if not scan_path.exists():
-            print(f"[!] Répertoire introuvable, ignoré : {scan_dir}", file=sys.stderr)
+            logger.warning("Répertoire introuvable, ignoré : %s", scan_dir)
             continue
 
         for filepath in scan_path.rglob("*"):
@@ -147,28 +80,45 @@ def scan_directories(scan_dirs, exiftool_ok):
                 continue
 
             total_files += 1
-            print(f"  [{total_files}] {filepath}")
+            path_str = str(filepath)
 
-            exif_date = get_exif_date(filepath, exiftool_ok)
-            date_source = "exif"
-            date_obj = exif_date
-            if date_obj is None:
-                date_obj = get_fallback_date(filepath)
-                date_source = "mtime_fallback"
+            try:
+                stat = filepath.stat()
+                size = stat.st_size
+                mtime = stat.st_mtime
+            except OSError as e:
+                logger.warning("Impossible d'accéder à %s : %s", filepath, e)
+                continue
 
-            file_hash = compute_sha256(filepath)
+            cached = get_cached_entry(cache_conn, path_str, size, mtime)
+
+            if cached is not None:
+                cache_hits += 1
+                file_hash, exif_date_iso, date_source = cached
+                date_obj = datetime.fromisoformat(exif_date_iso) if exif_date_iso else None
+            else:
+                cache_misses += 1
+                date_obj, date_source = get_best_date(filepath, exiftool_ok)
+                file_hash = compute_sha256(filepath)
+
+                store_cache_entry(
+                    cache_conn, path_str, size, mtime, file_hash,
+                    date_obj.isoformat() if date_obj else None, date_source,
+                )
+
+            logger.debug("Fichier [%d] : %s", total_files, filepath)
+            if total_files % 50 == 0:
+                logger.info(
+                    "... %d fichiers traités (cache: %d réutilisés, %d recalculés)",
+                    total_files, cache_hits, cache_misses,
+                )
 
             expected_rel = None
             if date_obj is not None:
                 expected_rel = expected_relative_path(date_obj, filepath.suffix)
 
-            try:
-                size = filepath.stat().st_size
-            except OSError:
-                size = None
-
             entries.append({
-                "chemin": str(filepath),
+                "chemin": path_str,
                 "taille_octets": size,
                 "date_utilisee": date_obj.isoformat() if date_obj else None,
                 "source_date": date_source if date_obj else "aucune",
@@ -176,7 +126,14 @@ def scan_directories(scan_dirs, exiftool_ok):
                 "chemin_cible_attendu": expected_rel,
             })
 
-    print(f"\nTotal fichiers scannés : {total_files}")
+        # Commit périodique par répertoire scanné pour ne pas perdre le
+        # travail déjà fait en cas d'interruption sur une longue collection.
+        cache_conn.commit()
+
+    logger.info(
+        "Scan terminé — %d fichier(s) parcouru(s) (cache: %d réutilisés, %d recalculés)",
+        total_files, cache_hits, cache_misses,
+    )
     return entries
 
 
@@ -205,7 +162,7 @@ def annotate_status(entries):
 
         if e["chemin_cible_attendu"]:
             chemin_actuel = Path(e["chemin"])
-            # On compare juste la fin du chemin (nom + 2 niveaux de dossiers)
+            # On compare juste la fin du chemin (nom + 3 niveaux de dossiers)
             attendu_parts = Path(e["chemin_cible_attendu"]).parts
             actuel_parts = chemin_actuel.parts[-len(attendu_parts):]
             if tuple(actuel_parts) != attendu_parts:
@@ -229,6 +186,7 @@ def write_csv_report(entries, output_path):
         "chemin", "statut", "taille_octets", "date_utilisee", "source_date",
         "chemin_cible_attendu", "hash_sha256", "doublons_avec",
     ]
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -260,28 +218,51 @@ def main():
         help="Un ou plusieurs répertoires à scanner (récursivement).",
     )
     parser.add_argument(
-        "--output", default="rapport_audit.csv",
-        help="Chemin du fichier CSV de sortie (défaut: rapport_audit.csv).",
+        "--output", default="/data/app_data/rapports/rapport_audit.csv",
+        help="Chemin du fichier CSV de sortie (défaut: /data/app_data/rapports/rapport_audit.csv).",
+    )
+    parser.add_argument(
+        "--cache-db", default="/data/app_data/hash_cache.db",
+        help=(
+            "Chemin de la base SQLite de cache des hashs/dates EXIF "
+            "(défaut: /data/app_data/hash_cache.db, sur le volume "
+            "persistant). Les fichiers inchangés depuis le dernier scan "
+            "ne sont pas relus."
+        ),
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Ignore et ne met pas à jour le cache : tout est recalculé.",
     )
     args = parser.parse_args()
 
+    logger.info("Audit lancé — scan: %s | output: %s", ", ".join(args.scan), args.output)
+
     exiftool_ok = exiftool_available()
     if not exiftool_ok:
-        print(
-            "[!] exiftool n'est pas trouvé sur ce système.\n"
-            "    Toutes les dates utilisées seront des dates de modification\n"
-            "    de fichier (moins fiable que l'EXIF). Pour l'installer :\n"
-            "      - Debian/Ubuntu : sudo apt install libimage-exiftool-perl\n"
-            "      - ou voir https://exiftool.org/\n",
-            file=sys.stderr,
+        logger.warning(
+            "exiftool n'est pas trouvé sur ce système. "
+            "Le script tentera d'extraire la date depuis le nom du fichier. "
+            "Pour installer exiftool : "
+            "Debian/Ubuntu : sudo apt install libimage-exiftool-perl | https://exiftool.org/"
         )
 
-    print(f"Scan de : {', '.join(args.scan)}\n")
-    entries = scan_directories(args.scan, exiftool_ok)
+    cache_db_path = ":memory:" if args.no_cache else args.cache_db
+    cache_conn = open_cache_db(cache_db_path)
+    if args.no_cache:
+        logger.info("--no-cache activé : cache ignoré pour cette exécution.")
+    else:
+        logger.info("Cache utilisé : %s", args.cache_db)
+
+    logger.info("Scan de : %s", ", ".join(args.scan))
+    entries = scan_directories(args.scan, exiftool_ok, cache_conn)
+    cache_conn.close()
+
     entries = annotate_status(entries)
     write_csv_report(entries, args.output)
     print_summary(entries)
-    print(f"\nRapport écrit dans : {args.output}")
+    logger.info("Rapport écrit dans : %s", args.output)
+    logger.info("Audit terminé — %d entrée(s) exportée(es)", len(entries))
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+"""Conftest partagé — fixtures et sys.path pour les tests."""
 import os
 import sys
 from pathlib import Path
@@ -8,17 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DEBUG_MODE = os.getenv("DEBUG", "0") == "1"
-LOG_LEVEL = __import__("logging").DEBUG if DEBUG_MODE else __import__("logging").INFO
-
-logging = __import__("logging")
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s",
-    level=LOG_LEVEL,
-)
-logger = logging.getLogger("gestion_photo_tests")
-for _noisy_lib in ("httpx", "urllib3", "anthropic", "apscheduler", "telegram"):
-    logging.getLogger(_noisy_lib).setLevel(logging.WARNING)
+os.environ.setdefault("DEBUG", "0")
 
 
 @pytest.fixture
@@ -37,7 +28,14 @@ def make_media_file(media_dir):
         if mtime is not None:
             epoch = mtime.timestamp()
             os.utime(path, (epoch, epoch))
-        logger.debug("Fichier média factice créé: %s", path)
         return path
 
     return _make
+
+
+@pytest.fixture
+def cache_conn():
+    import photo_common
+    conn = photo_common.open_cache_db(":memory:")
+    yield conn
+    conn.close()
