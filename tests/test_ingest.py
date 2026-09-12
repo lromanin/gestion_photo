@@ -25,6 +25,38 @@ class TestResolveUniquePath:
         assert out.name == "a-3.jpg"
 
 
+class TestResolveBurstPath:
+    def test_no_collision(self, tmp_path):
+        des = tmp_path / "2024/202406/20240612/20240612-143022.jpg"
+        des.parent.mkdir(parents=True, exist_ok=True)
+        assert ingest.resolve_burst_path(des) == des
+
+    def test_collision_adds_a(self, tmp_path):
+        dest = tmp_path / "2024/202406/20240612"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "20240612-143022.jpg").write_bytes(b"x")
+        out = ingest.resolve_burst_path(dest / "20240612-143022.jpg")
+        assert out == dest / "20240612-143022a.jpg"
+
+    def test_multiple_letters_sequential(self, tmp_path):
+        dest = tmp_path / "2024/202406/20240612"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "20240612-143022.jpg").write_bytes(b"1")
+        (dest / "20240612-143022a.jpg").write_bytes(b"2")
+        out = ingest.resolve_burst_path(dest / "20240612-143022.jpg")
+        assert out == dest / "20240612-143022b.jpg"
+
+    def test_fallback_to_numeric_after_z(self, tmp_path, caplog):
+        dest = tmp_path / "2024/202406/20240612"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "20240612-143022.jpg").write_bytes(b"0")
+        for i, letter in enumerate("abcdefghijklmnopqrstuvwxyz"):
+            (dest / f"20240612-143022{letter}.jpg").write_bytes(bytes([i + 1]))
+        out = ingest.resolve_burst_path(dest / "20240612-143022.jpg")
+        assert out.name == "20240612-143022-2.jpg"
+        assert "bascule sur un suffixe numérique" in caplog.text
+
+
 class TestLoadKnownHashes:
     def test_empty(self, cache_conn):
         assert ingest.load_known_hashes(cache_conn, "/dest") == {}

@@ -296,3 +296,49 @@ def expected_relative_path(date_obj, extension):
     yyyymmdd = date_obj.strftime("%Y%m%d")
     yyyymmdd_hhmmss = date_obj.strftime("%Y%m%d-%H%M%S")
     return f"{yyyy}/{yyyymm}/{yyyymmdd}/{yyyymmdd_hhmmss}{extension.lower()}"
+
+
+# Suffixe de désambiguïsation pour les rafales : plusieurs appareils
+# nomment la 1ère photo d'une seconde donnée sans suffixe
+# (AAAAMMJJ-HHMMSS.ext), puis ajoutent une ou plusieurs lettres minuscules
+# pour les suivantes prises à la même seconde (AAAAMMJJ-HHMMSSa.ext,
+# AAAAMMJJ-HHMMSSb.ext...). Ce n'est pas universel (dépend de l'appareil)
+# mais assez répandu pour être reconnu comme un nommage valide plutôt que
+# signalé comme une erreur.
+BURST_SUFFIX_RE = re.compile(r"^[a-z]+$")
+
+
+def is_expected_filename(actual_path, expected_relative):
+    """
+    Vérifie si actual_path correspond au chemin cible attendu
+    (expected_relative, une chaîne du type "AAAA/AAAAMM/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext"),
+    en acceptant un suffixe de rafale (lettres minuscules) sur le nom de
+    fichier. Compare uniquement les N derniers éléments du chemin (N =
+    profondeur de expected_relative), pas le chemin absolu complet.
+    """
+    expected = Path(expected_relative)
+    expected_dirs = expected.parts[:-1]
+    expected_stem = expected.stem
+    expected_suffix = expected.suffix.lower()
+
+    actual = Path(actual_path)
+    depth = len(expected_dirs) + 1
+    actual_relevant_parts = actual.parts[-depth:]
+    actual_dirs = actual_relevant_parts[:-1]
+    actual_stem = actual.stem
+    actual_suffix = actual.suffix.lower()
+
+    if tuple(actual_dirs) != expected_dirs:
+        return False
+    if actual_suffix != expected_suffix:
+        return False
+    if actual_stem == expected_stem:
+        return True
+
+    # Variante de rafale : même base + suffixe lettres uniquement
+    if actual_stem.startswith(expected_stem):
+        remainder = actual_stem[len(expected_stem):]
+        if BURST_SUFFIX_RE.fullmatch(remainder):
+            return True
+
+    return False

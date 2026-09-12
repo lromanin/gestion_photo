@@ -77,7 +77,9 @@ def resolve_unique_path(desired_path):
     """
     Si desired_path existe déjà, ajoute un suffixe -2, -3... avant
     l'extension jusqu'à trouver un chemin libre. Ne touche jamais à un
-    fichier existant.
+    fichier existant. Utilisé pour les chemins qui ne suivent pas la
+    convention de nommage par date (quarantaine, sans-date) : il n'y a
+    pas de suffixe "naturel" à respecter, un simple compteur suffit.
     """
     if not desired_path.exists():
         return desired_path
@@ -91,6 +93,36 @@ def resolve_unique_path(desired_path):
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+def resolve_burst_path(desired_path):
+    """
+    Si desired_path existe déjà (collision sur un nom daté
+    AAAAMMJJ-HHMMSS.ext, contenu différent — typiquement une rafale à la
+    même seconde), ajoute une lettre minuscule (a, b, c...) avant
+    l'extension, cohérent avec la convention déjà en usage dans la
+    collection existante (1ère photo sans suffixe, suivantes -a, -b...).
+    Retombe sur resolve_unique_path (suffixe numérique) si les 26 lettres
+    sont déjà prises — cas extrême, mais on ne bloque jamais le
+    traitement pour autant.
+    """
+    if not desired_path.exists():
+        return desired_path
+
+    stem = desired_path.stem
+    suffix = desired_path.suffix
+    parent = desired_path.parent
+
+    for letter_code in range(ord("a"), ord("z") + 1):
+        candidate = parent / f"{stem}{chr(letter_code)}{suffix}"
+        if not candidate.exists():
+            return candidate
+
+    logger.warning(
+        "Plus de 26 fichiers différents pour %s : bascule sur un suffixe "
+        "numérique, cas très inhabituel à vérifier manuellement.", desired_path,
+    )
+    return resolve_unique_path(desired_path)
 
 
 def append_doublon_log(log_path, quarantine_path, original_path, file_hash):
@@ -181,8 +213,9 @@ def process_file(filepath, dest_root, quarantine_dir, sans_date_dir,
                 return "doublon"
             else:
                 # Même nom cible, contenu différent (ex: rafale à la même
-                # seconde) -> suffixe pour ne jamais écraser l'existant.
-                target_path = resolve_unique_path(target_path)
+                # seconde) -> lettre de désambiguïsation, cohérente avec
+                # la convention déjà en usage dans la collection.
+                target_path = resolve_burst_path(target_path)
 
         move_and_recache(filepath, target_path, file_hash, date_obj,
                           date_source, cache_conn, dry_run)

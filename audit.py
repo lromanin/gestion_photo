@@ -50,6 +50,7 @@ from photo_common import (
     get_best_date,
     get_cached_entry,
     get_logger,
+    is_expected_filename,
     open_cache_db,
     store_cache_entry,
 )
@@ -57,10 +58,12 @@ from photo_common import (
 logger = get_logger("gestion_photo.audit")
 
 
-def scan_directories(scan_dirs, exiftool_ok, cache_conn):
+def scan_directories(scan_dirs, exiftool_ok, cache_conn, force_refresh=False):
     """
     Parcourt les répertoires donnés, retourne une liste de dicts décrivant
-    chaque fichier trouvé. Réutilise le cache pour les fichiers inchangés.
+    chaque fichier trouvé. Réutilise le cache pour les fichiers inchangés,
+    sauf si force_refresh est activé (tout est recalculé, et la base
+    persistante est mise à jour avec les nouveaux résultats).
     """
     entries = []
     total_files = 0
@@ -90,7 +93,7 @@ def scan_directories(scan_dirs, exiftool_ok, cache_conn):
                 logger.warning("Impossible d'accéder à %s : %s", filepath, e)
                 continue
 
-            cached = get_cached_entry(cache_conn, path_str, size, mtime)
+            cached = None if force_refresh else get_cached_entry(cache_conn, path_str, size, mtime)
 
             if cached is not None:
                 cache_hits += 1
@@ -161,11 +164,7 @@ def annotate_status(entries):
             statuts.append("sans_exif")
 
         if e["chemin_cible_attendu"]:
-            chemin_actuel = Path(e["chemin"])
-            # On compare juste la fin du chemin (nom + 3 niveaux de dossiers)
-            attendu_parts = Path(e["chemin_cible_attendu"]).parts
-            actuel_parts = chemin_actuel.parts[-len(attendu_parts):]
-            if tuple(actuel_parts) != attendu_parts:
+            if not is_expected_filename(e["chemin"], e["chemin_cible_attendu"]):
                 statuts.append("mal_nomme")
 
         e["statut"] = "+".join(statuts) if statuts else "ok"
@@ -234,7 +233,20 @@ def main():
         "--no-cache", action="store_true",
         help="Ignore et ne met pas à jour le cache : tout est recalculé.",
     )
+    parser.add_argument(
+        "--force-refresh", action="store_true",
+        help=(
+            "Recalcule tout (hash + date) même pour les fichiers déjà en "
+            "cache et inchangés, et met à jour la base persistante avec "
+            "les nouveaux résultats. Utile après une mise à jour d'exiftool "
+            "ou en cas de doute sur les données déjà en cache. Différent "
+            "de --no-cache, qui ignore le cache sans le mettre à jour."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.no_cache and args.force_refresh:
+        parser.error("--no-cache et --force-refresh sont incompatibles (le premier ignore le cache, le second le met à jour).")
 
     logger.info("Audit lancé — scan: %s | output: %s", ", ".join(args.scan), args.output)
 
@@ -254,8 +266,11 @@ def main():
     else:
         logger.info("Cache utilisé : %s", args.cache_db)
 
+    if args.force_refresh:
+        logger.info("--force-refresh activé : tout est recalculé, le cache sera mis à jour.")
+
     logger.info("Scan de : %s", ", ".join(args.scan))
-    entries = scan_directories(args.scan, exiftool_ok, cache_conn)
+    entries = scan_directories(args.scan, exiftool_ok, cache_conn, force_refresh=args.force_refresh)
     cache_conn.close()
 
     entries = annotate_status(entries)

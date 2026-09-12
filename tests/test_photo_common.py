@@ -196,3 +196,53 @@ class TestCacheDb:
         assert photo_common.find_cached_path_by_hash(cache_conn, "hX", "/dest") == "/dest/2024/202406/20240612/f.jpg"
         assert photo_common.find_cached_path_by_hash(cache_conn, "hX", "/autre") is None
         assert photo_common.find_cached_path_by_hash(cache_conn, "ZZZ") is None
+
+
+class TestIsExpectedFilename:
+    def test_exact_match(self):
+        assert photo_common.is_expected_filename(
+            "/data/2024/202406/20240612/20240612-143022.jpg",
+            "2024/202406/20240612/20240612-143022.jpg",
+        ) is True
+
+    def test_burst_suffix_a(self):
+        assert photo_common.is_expected_filename(
+            "/data/2024/202406/20240612/20240612-143022a.jpg",
+            "2024/202406/20240612/20240612-143022.jpg",
+        ) is True
+
+    def test_burst_suffix_z(self):
+        assert photo_common.is_expected_filename(
+            "/mnt/pool/photos/2024/202406/20240612/20240612-143022z.jpg",
+            "2024/202406/20240612/20240612-143022.jpg",
+        ) is True
+
+    def test_burst_multiple_letters(self):
+        assert photo_common.is_expected_filename(
+            "/x/2024/202406/20240612/20240612-143022abc.jpg",
+            "2024/202406/20240612/20240612-143022.jpg",
+        ) is True
+
+    def test_wrong_directory_structure(self):
+        assert photo_common.is_expected_filename(
+            "/data/2024/202406/20240613/20240612-143022.jpg",
+            "2024/202406/20240612/20240612-143022.jpg",
+        ) is False
+
+    def test_wrong_suffix(self):
+        assert photo_common.is_expected_filename(
+            "/data/2024/202406/20240612/20240612-143022.png",
+            "2024/202406/20240612/20240612-143022.jpg",
+        ) is False
+
+    def test_burst_with_number_suffix_rejected(self):
+        assert photo_common.is_expected_filename(
+            "/data/2024/202406/20240612/20240612-143022-1.jpg",
+            "2024/202406/20240612/20240612-143022.jpg",
+        ) is False
+
+    def test_different_base_name(self):
+        assert photo_common.is_expected_filename(
+            "/data/2024/202406/20240612/20240613-143022.jpg",
+            "2024/202406/20240612/20240612-143022.jpg",
+        ) is False

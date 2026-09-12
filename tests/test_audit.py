@@ -67,6 +67,27 @@ class TestScanDirectories:
         audit.scan_directories([str(media_dir)], False, cache_conn)
         assert calls["n"] == 2
 
+    def test_force_refresh_recomputes_even_when_cached(self, media_dir, make_media_file, monkeypatch, cache_conn):
+        p = make_media_file("IMG_20240612-143022.jpg")
+        calls = {"n": 0}
+        real = audit.compute_sha256
+        def counting(path):
+            calls["n"] += 1
+            return real(path)
+        monkeypatch.setattr(audit, "compute_sha256", counting)
+
+        # Premier scan : cache miss -> calcule
+        audit.scan_directories([str(media_dir)], False, cache_conn)
+        assert calls["n"] == 1
+
+        # Deuxième scan normal : cache hit -> ne recalcule pas
+        audit.scan_directories([str(media_dir)], False, cache_conn)
+        assert calls["n"] == 1
+
+        # Troisième scan avec force_refresh=True : recalcule malgré le cache valide
+        audit.scan_directories([str(media_dir)], False, cache_conn, force_refresh=True)
+        assert calls["n"] == 2
+
 
 class TestAnnotateStatus:
     def _base(self, chemin, hash_val, source_date, cible=None):
@@ -185,3 +206,23 @@ class TestAuditMain:
         rows = list(csv.DictReader(open(out, newline="", encoding="utf-8")))
         assert len(rows) == 1
         assert rows[0]["source_date"] == "filename_datetime"
+
+    def test_force_refresh_recomputes(self, media_dir, make_media_file, tmp_path, monkeypatch):
+        make_media_file("IMG_20240612_143022.jpg")
+        out = tmp_path / "rapports" / "rapport_audit.csv"
+        cache_db = tmp_path / "hash_cache.db"
+        monkeypatch.setattr("sys.argv", ["audit.py", "--scan", str(media_dir),
+                                         "--output", str(out), "--force-refresh",
+                                         "--cache-db", str(cache_db)])
+        audit.main()
+        assert out.exists()
+        rows = list(csv.DictReader(open(out, newline="", encoding="utf-8")))
+        assert len(rows) == 1
+
+    def test_force_refresh_and_no_cache_incompatible(self, tmp_path, monkeypatch):
+        out = tmp_path / "rapports" / "rapport_audit.csv"
+        monkeypatch.setattr("sys.argv", ["audit.py", "--scan", str(tmp_path),
+                                         "--output", str(out), "--no-cache", "--force-refresh"])
+        with pytest.raises(SystemExit) as exc:
+            audit.main()
+        assert exc.value.code == 2
