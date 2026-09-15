@@ -246,3 +246,155 @@ class TestIsExpectedFilename:
             "/data/2024/202406/20240612/20240613-143022.jpg",
             "2024/202406/20240612/20240612-143022.jpg",
         ) is False
+
+
+class TestWalkMediaFiles:
+    def test_walks_recursively(self, media_dir, make_media_file):
+        make_media_file("2024/20240612/img1.jpg")
+        make_media_file("sub/img2.CR2")
+        make_media_file("sub/deep/img3.mp4")
+        make_media_file("ignore.txt")  # non-media
+        result = list(photo_common.walk_media_files(media_dir))
+        noms = {p.name for p in result}
+        assert noms == {"img1.jpg", "img2.CR2", "img3.mp4"}
+
+    def test_filters_extensions(self, media_dir, make_media_file):
+        make_media_file("keep.jpg")
+        make_media_file("keep.cr2")
+        make_media_file("ignore.txt")
+        make_media_file("ignore.pdf")
+        result = list(photo_common.walk_media_files(media_dir))
+        assert len(result) == 2
+        assert all(p.suffix.lower() in {".jpg", ".cr2"} for p in result)
+
+    def test_skips_nonexistent(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger="gestion_photo")
+        result = list(photo_common.walk_media_files(tmp_path / "ghost"))
+        assert result == []
+        assert any("introuvable" in r.message for r in caplog.records)
+
+    def test_logs_permission_error(self, tmp_path, caplog):
+        # Create a directory we can't read
+        import os
+        caplog.set_level(logging.WARNING, logger="gestion_photo")
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        (hidden / "secret.jpg").write_bytes(b"x")
+        # Remove read permission on the directory
+        os.chmod(hidden, 0o000)
+        try:
+            result = list(photo_common.walk_media_files(tmp_path))
+            # The function should log the error and skip the hidden dir
+            assert len(result) == 0  # no files from the hidden dir
+            assert any("Accès refusé" in r.message for r in caplog.records)
+        finally:
+            # Restore permission for cleanup
+            os.chmod(hidden, 0o700)
+
+
+class TestIsBareName:
+    def test_bare_name_valid(self, tmp_path):
+        f = tmp_path / "20240612-143022.jpg"
+        f.write_bytes(b"x")
+        assert photo_common.is_bare_name(f) is True
+
+    def test_bare_name_with_burst_suffix_rejected(self, tmp_path):
+        f = tmp_path / "20240612-143022a.jpg"
+        f.write_bytes(b"x")
+        assert photo_common.is_bare_name(f) is False
+
+    def test_bare_name_with_numeric_suffix_rejected(self, tmp_path):
+        f = tmp_path / "20240612-143022-1.jpg"
+        f.write_bytes(b"x")
+        assert photo_common.is_bare_name(f) is False
+
+    def test_bare_name_wrong_format_rejected(self, tmp_path):
+        f = tmp_path / "IMG_20240612_143022.jpg"
+        f.write_bytes(b"x")
+        assert photo_common.is_bare_name(f) is False
+
+
+class TestResolveUniquePath:
+    def test_no_collision(self, tmp_path):
+        p = tmp_path / "dest" / "a.jpg"
+        p.parent.mkdir(parents=True)
+        assert photo_common.resolve_unique_path(p) == p
+
+    def test_collision_adds_suffix(self, tmp_path):
+        (tmp_path / "dest").mkdir(parents=True)
+        (tmp_path / "dest" / "a.jpg").write_bytes(b"x")
+        out = photo_common.resolve_unique_path(tmp_path / "dest" / "a.jpg")
+        assert out.name == "a-2.jpg"
+
+    def test_multiple_collisions(self, tmp_path):
+        (tmp_path / "a.jpg").write_bytes(b"x")
+        (tmp_path / "a-2.jpg").write_bytes(b"x")
+        out = photo_common.resolve_unique_path(tmp_path / "a.jpg")
+        assert out.name == "a-3.jpg"
+
+
+class TestAppendDoublonLog:
+    def test_creates_header_on_new(self, tmp_path):
+        log_path = tmp_path / "doublons.csv"
+        photo_common.append_doublon_log(log_path, "q/a.jpg", "d/b.jpg", "hash1")
+        import csv
+        rows = list(csv.reader(open(log_path)))
+        assert rows[0] == ["horodatage", "fichier_en_quarantaine",
+                           "fichier_original_correspondant", "hash"]
+        assert rows[1][1:] == ["q/a.jpg", "d/b.jpg", "hash1"]
+
+    def test_appends_without_duplicate_header(self, tmp_path):
+        log_path = tmp_path / "doublons.csv"
+        photo_common.append_doublon_log(log_path, "q/a.jpg", "d/b.jpg", "h1")
+        photo_common.append_doublon_log(log_path, "q/c.jpg", "d/b.jpg", "h2")
+        import csv
+        rows = list(csv.reader(open(log_path)))
+        assert len(rows) == 3
+        assert rows[1][3] == "h1" and rows[2][3] == "h2"
+
+
+class TestMoveAndRecache:
+    def test_dry_run_no_move(self, tmp_path, cache_conn):
+        src = tmp_path / "src.jpg"; src.write_bytes(b"data")
+        dest = tmp_path / "dest.jpg"
+        photo_common.move_and_recache(src, dest, "h", None, "aucune", cache_conn, dry_run=True)
+        assert src.exists()
+        assert not dest.exists()
+
+    def test_real_move_updates_cache(self, tmp_path, cache_conn):
+        src = tmp_path / "src.jpg"; src.write_bytes(b"data")
+        dest = tmp_path / "out" / "dest.jpg"
+        photo_common.move_and_recache(src, dest, "h", None, "aucune", cache_conn, dry_run=False)
+        assert not src.exists()
+        assert dest.exists() and dest.read_bytes() == b"data"
+        st = dest.stat()
+        assert photo_common.get_cached_entry(cache_conn, str(dest), st.st_size, st.st_mtime) is not None
+        assert photo_common.get_cached_entry(cache_conn, str(src), 0, 0.0) is None
+
+
+class TestGetCachedOrCompute:
+    def test_cache_hit(self, tmp_path, cache_conn):
+        f = tmp_path / "test.jpg"; f.write_bytes(b"test-data")
+        # First call: cache miss
+        h1, d1, s1, hit1 = photo_common.get_cached_or_compute(f, cache_conn, False)
+        assert hit1 is False
+        # Second call: cache hit
+        h2, d2, s2, hit2 = photo_common.get_cached_or_compute(f, cache_conn, False)
+        assert hit2 is True
+        assert h1 == h2
+
+    def test_cache_miss_on_modification(self, tmp_path, cache_conn):
+        f = tmp_path / "test.jpg"; f.write_bytes(b"v1")
+        photo_common.get_cached_or_compute(f, cache_conn, False)
+        f.write_bytes(b"v2-modified")
+        h, d, s, hit = photo_common.get_cached_or_compute(f, cache_conn, False)
+        assert hit is False
+        # hash has been recalculated for the new content
+        assert h == photo_common.compute_sha256(f)
+
+    def test_unreadable_returns_error(self, tmp_path, cache_conn, caplog):
+        caplog.set_level(logging.WARNING, logger="gestion_photo")
+        f = tmp_path / "missing.jpg"
+        h, d, s, hit = photo_common.get_cached_or_compute(f, cache_conn, False)
+        assert h is None and d is None and s == "erreur" and hit is False
+        assert any("Impossible d'accéder" in r.message for r in caplog.records)

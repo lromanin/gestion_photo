@@ -37,21 +37,19 @@ Sécurité :
 """
 
 import argparse
-import csv
-import shutil
-from datetime import datetime
 from pathlib import Path
 
 from photo_common import (
-    ALL_EXTENSIONS,
+    append_doublon_log,
     compute_sha256,
-    delete_cache_entry,
     exiftool_available,
     expected_relative_path,
     get_best_date,
     get_logger,
+    move_and_recache,
     open_cache_db,
-    store_cache_entry,
+    resolve_unique_path,
+    walk_media_files,
 )
 
 logger = get_logger("gestion_photo.ingest")
@@ -71,28 +69,6 @@ def load_known_hashes(cache_conn, dest_root):
         (prefix_pattern,),
     ).fetchall()
     return {file_hash: path for file_hash, path in rows}
-
-
-def resolve_unique_path(desired_path):
-    """
-    Si desired_path existe déjà, ajoute un suffixe -2, -3... avant
-    l'extension jusqu'à trouver un chemin libre. Ne touche jamais à un
-    fichier existant. Utilisé pour les chemins qui ne suivent pas la
-    convention de nommage par date (quarantaine, sans-date) : il n'y a
-    pas de suffixe "naturel" à respecter, un simple compteur suffit.
-    """
-    if not desired_path.exists():
-        return desired_path
-
-    stem = desired_path.stem
-    suffix = desired_path.suffix
-    parent = desired_path.parent
-    counter = 2
-    while True:
-        candidate = parent / f"{stem}-{counter}{suffix}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
 
 
 def resolve_burst_path(desired_path):
@@ -123,49 +99,6 @@ def resolve_burst_path(desired_path):
         "numérique, cas très inhabituel à vérifier manuellement.", desired_path,
     )
     return resolve_unique_path(desired_path)
-
-
-def append_doublon_log(log_path, quarantine_path, original_path, file_hash):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    is_new = not log_path.exists()
-    with open(log_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if is_new:
-            writer.writerow([
-                "horodatage", "fichier_en_quarantaine",
-                "fichier_original_correspondant", "hash",
-            ])
-        writer.writerow([
-            datetime.now().isoformat(timespec="seconds"),
-            str(quarantine_path), str(original_path), file_hash,
-        ])
-
-
-def move_and_recache(src_path, dest_path, file_hash, date_obj, date_source,
-                      cache_conn, dry_run):
-    """
-    Déplace src_path vers dest_path (en créant les dossiers nécessaires),
-    met à jour le cache SQLite (nouvelle entrée pour dest_path, suppression
-    de l'ancienne entrée pour src_path). No-op réel si dry_run.
-    """
-    if dry_run:
-        logger.info("[dry-run] %s -> %s", src_path, dest_path)
-        return
-
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(src_path), str(dest_path))
-
-    try:
-        new_stat = dest_path.stat()
-        store_cache_entry(
-            cache_conn, str(dest_path), new_stat.st_size, new_stat.st_mtime,
-            file_hash, date_obj.isoformat() if date_obj else None, date_source,
-        )
-    except OSError as e:
-        logger.warning("Impossible de mettre à jour le cache pour %s : %s", dest_path, e)
-
-    delete_cache_entry(cache_conn, str(src_path))
-    cache_conn.commit()
 
 
 def process_file(filepath, dest_root, quarantine_dir, sans_date_dir,
@@ -252,10 +185,8 @@ def ingest_directory(source_dirs, dest_root, quarantine_dir, sans_date_dir,
             logger.warning("Répertoire source introuvable, ignoré : %s", source_dir)
             continue
 
-        for filepath in sorted(source_path.rglob("*")):
+        for filepath in sorted(walk_media_files(source_path)):
             if not filepath.is_file():
-                continue
-            if filepath.suffix.lower() not in ALL_EXTENSIONS:
                 continue
 
             try:

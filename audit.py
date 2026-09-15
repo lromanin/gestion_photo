@@ -43,7 +43,6 @@ from datetime import datetime
 from pathlib import Path
 
 from photo_common import (
-    ALL_EXTENSIONS,
     compute_sha256,
     exiftool_available,
     expected_relative_path,
@@ -53,6 +52,7 @@ from photo_common import (
     is_expected_filename,
     open_cache_db,
     store_cache_entry,
+    walk_media_files,
 )
 
 logger = get_logger("gestion_photo.audit")
@@ -76,10 +76,8 @@ def scan_directories(scan_dirs, exiftool_ok, cache_conn, force_refresh=False):
             logger.warning("Répertoire introuvable, ignoré : %s", scan_dir)
             continue
 
-        for filepath in scan_path.rglob("*"):
+        for filepath in walk_media_files(scan_path):
             if not filepath.is_file():
-                continue
-            if filepath.suffix.lower() not in ALL_EXTENSIONS:
                 continue
 
             total_files += 1

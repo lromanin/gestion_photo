@@ -43,8 +43,10 @@ Le conteneur ne s'exécute pas en `root`. Un utilisateur dédié (`photomgr`, UI
 │       ├── Dockerfile
 │       ├── docker-compose.yml
 │       ├── deploy.sh
+│       ├── photo_common.py            ← logique partagée (EXIF, hash, cache, doublons)
 │       ├── audit.py
 │       ├── ingest.py
+│       ├── dedupe_collection.py       ← nettoie les doublons déjà présents dans la collection
 │       ├── requirements.txt
 │       └── tests/
 │
@@ -144,7 +146,21 @@ Medias/photos_et_videos/  ──(cron rclone sync)──►  Mega
 3. **Ingestion automatisée** — `ingest.py` remplace les deux scripts actuels (photo + vidéo unifiés)
 4. **Sync Mega automatisée** — cron + rclone remplace l'upload manuel
 
-## 7. Évolutions possibles (hors périmètre initial)
+## 7. Nettoyage des doublons déjà présents dans la collection
+
+`audit.py` et `ingest.py` empêchent les *nouveaux* doublons d'entrer dans `photos_et_videos/`, mais ne corrigent pas ceux qui y sont déjà (ex : un ancien script avait par erreur traité deux copies identiques comme une rafale légitime : `20230728-191553.jpg` et `20230728-191553a.jpg`, alors que c'est le même contenu).
+
+`dedupe_collection.py` scanne la collection rangée, regroupe les fichiers par hash, et pour chaque groupe de doublons :
+- garde en place le fichier au nom "nu" (`AAAAMMJJ-HHMMSS.ext`, sans lettre de rafale) s'il existe dans le groupe ; à défaut, garde le premier par ordre alphabétique
+- déplace tous les autres exemplaires vers `_doublons_detectes/` (jamais supprimés), avec entrée dans `doublons_log.csv`
+
+```bash
+docker exec photo-manager python3 dedupe_collection.py --dry-run
+```
+
+S'appuie sur le même cache SQLite que les autres scripts pour rester rapide sur une collection de plusieurs dizaines de milliers de fichiers.
+
+## 8. Évolutions possibles (hors périmètre initial)
 
 - Interface web de visualisation type Immich/PhotoPrism, en plus (pas à la place) de cette base de scripts, une fois la collection assainie
 - Détection de quasi-doublons (photo recadrée/recompressée) via perceptual hashing, si le hash exact ne suffit pas

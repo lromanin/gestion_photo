@@ -11,6 +11,7 @@ dérivent l'un de l'autre au fil des modifications :
     AAAA/AAAAMM/AAAAMMJJ/AAAAMMJJ-HHMMSS.ext
 """
 
+import csv
 import hashlib
 import json
 import logging
@@ -151,6 +152,38 @@ def find_cached_path_by_hash(conn, file_hash, path_prefix=None):
 
 
 # --- Extraction de date : EXIF, puis nom de fichier, jamais mtime ---
+
+def walk_media_files(root_dir):
+    """
+    Parcourt récursivement root_dir et yield les Path des fichiers média
+    reconnus (voir ALL_EXTENSIONS).
+
+    Contrairement à Path.rglob("*"), qui ignore SILENCIEUSEMENT les
+    sous-dossiers illisibles (permission refusée) — aucune erreur, aucun
+    avertissement, juste un scan incomplet sans aucun signal — cette
+    fonction détecte chaque répertoire inaccessible et log un
+    avertissement explicite. Un scan incomplet ne doit jamais passer
+    inaperçu.
+    """
+    root_path = Path(root_dir)
+    if not root_path.exists():
+        logger.warning("Répertoire introuvable, ignoré : %s", root_dir)
+        return
+
+    def on_error(os_error):
+        logger.warning(
+            "Accès refusé à %s : %s — ce sous-dossier est IGNORÉ, son "
+            "contenu ne sera PAS traité. Vérifier les permissions "
+            "(chown/chmod) sur le NAS.",
+            getattr(os_error, "filename", root_dir), os_error,
+        )
+
+    for dirpath, _dirnames, filenames in os.walk(root_path, onerror=on_error):
+        for filename in filenames:
+            filepath = Path(dirpath) / filename
+            if filepath.suffix.lower() in ALL_EXTENSIONS:
+                yield filepath
+
 
 def exiftool_available():
     return shutil.which("exiftool") is not None
@@ -342,3 +375,113 @@ def is_expected_filename(actual_path, expected_relative):
             return True
 
     return False
+
+
+# Nom "nu" attendu pour un fichier bien rangé : AAAAMMJJ-HHMMSS, sans
+# suffixe de rafale. Sert à déterminer quel exemplaire garder en place
+# quand plusieurs fichiers identiques (même hash) coexistent.
+BARE_NAME_RE = re.compile(r"^\d{8}-\d{6}$")
+
+
+def is_bare_name(filepath):
+    """True si le nom du fichier suit le format nu AAAAMMJJ-HHMMSS.ext,
+    sans lettre de rafale ni suffixe numérique."""
+    return bool(BARE_NAME_RE.fullmatch(Path(filepath).stem))
+
+
+# --- Gestion des doublons : déplacement en quarantaine, log, cache ---
+
+def resolve_unique_path(desired_path):
+    """
+    Si desired_path existe déjà, ajoute un suffixe -2, -3... avant
+    l'extension jusqu'à trouver un chemin libre. Ne touche jamais à un
+    fichier existant. Utilisé pour les chemins qui ne suivent pas la
+    convention de nommage par date (quarantaine, sans-date) : il n'y a
+    pas de suffixe "naturel" à respecter, un simple compteur suffit.
+    """
+    if not desired_path.exists():
+        return desired_path
+
+    stem = desired_path.stem
+    suffix = desired_path.suffix
+    parent = desired_path.parent
+    counter = 2
+    while True:
+        candidate = parent / f"{stem}-{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def append_doublon_log(log_path, quarantine_path, original_path, file_hash):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not log_path.exists()
+    with open(log_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow([
+                "horodatage", "fichier_en_quarantaine",
+                "fichier_original_correspondant", "hash",
+            ])
+        writer.writerow([
+            datetime.now().isoformat(timespec="seconds"),
+            str(quarantine_path), str(original_path), file_hash,
+        ])
+
+
+def move_and_recache(src_path, dest_path, file_hash, date_obj, date_source,
+                      cache_conn, dry_run):
+    """
+    Déplace src_path vers dest_path (en créant les dossiers nécessaires),
+    met à jour le cache SQLite (nouvelle entrée pour dest_path, suppression
+    de l'ancienne entrée pour src_path). No-op réel si dry_run.
+    """
+    if dry_run:
+        logger.info("[dry-run] %s -> %s", src_path, dest_path)
+        return
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src_path), str(dest_path))
+
+    try:
+        new_stat = dest_path.stat()
+        store_cache_entry(
+            cache_conn, str(dest_path), new_stat.st_size, new_stat.st_mtime,
+            file_hash, date_obj.isoformat() if date_obj else None, date_source,
+        )
+    except OSError as e:
+        logger.warning("Impossible de mettre à jour le cache pour %s : %s", dest_path, e)
+
+    delete_cache_entry(cache_conn, str(src_path))
+    cache_conn.commit()
+
+
+def get_cached_or_compute(filepath, cache_conn, exiftool_ok):
+    """
+    Retourne (hash, date_obj, date_source, cache_hit) pour filepath, en
+    réutilisant le cache si le fichier n'a pas changé (taille + mtime
+    identiques), sinon recalcule (hash + date via get_best_date) et met
+    à jour le cache. Retourne (None, None, "erreur", False) si le fichier
+    est illisible (stat ou lecture impossible).
+    """
+    path_str = str(filepath)
+    try:
+        stat = filepath.stat()
+        size, mtime = stat.st_size, stat.st_mtime
+    except OSError as e:
+        logger.warning("Impossible d'accéder à %s : %s", filepath, e)
+        return None, None, "erreur", False
+
+    cached = get_cached_entry(cache_conn, path_str, size, mtime)
+    if cached is not None:
+        file_hash, exif_date_iso, date_source = cached
+        date_obj = datetime.fromisoformat(exif_date_iso) if exif_date_iso else None
+        return file_hash, date_obj, date_source, True
+
+    date_obj, date_source = get_best_date(filepath, exiftool_ok)
+    file_hash = compute_sha256(filepath)
+    store_cache_entry(
+        cache_conn, path_str, size, mtime, file_hash,
+        date_obj.isoformat() if date_obj else None, date_source,
+    )
+    return file_hash, date_obj, date_source, False
